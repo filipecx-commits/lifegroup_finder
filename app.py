@@ -3,18 +3,22 @@ import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import re
-import requests # Nova biblioteca para falar com o n8n
+import requests
 import json
 from datetime import datetime
+import urllib.parse
 
-# --- CONFIGURAÇÃO ---
+# --- CONFIGURAÇÃO DE INTEGRAÇÃO (Backend) ---
+# Seu Link do Google Apps Script
+WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbx0ZaLmXHtV-nzuaNEbd2DTTPEil7qVUgsKGqNlvgryj9jDF1_m5pkwBPcUXFr9rJ8p/exec"
+
+# --- CONFIGURAÇÃO DE TESTE ---
+# True = Redireciona tudo para você. False = Usa os dados reais dos líderes.
+MODO_TESTE = True 
+ZAP_TESTE = "5519992071423" # Seu número para testes
+
+# --- CONFIGURAÇÃO DA PÁGINA ---
 URL_CSV = "Cadastro dos Lifegroups.csv"
-
-# ⚠️ IMPORTANTE: Você vai colar aqui o link de TESTE do seu n8n (Webhook)
-# Enquanto não tiver o link, o botão vai dar um aviso.
-WEBHOOK_URL = "" 
-
-# Configuração da Página
 st.set_page_config(page_title="LifeGroups | Paz São Paulo", page_icon="💙", layout="centered")
 
 # --- ESTILOS CSS ---
@@ -26,6 +30,7 @@ st.markdown("""
         color: white;
         border-radius: 8px;
         font-weight: bold;
+        text-transform: uppercase;
     }
     .filter-label { font-weight: 600; color: #1C355E; }
     h1 { color: #1C355E; }
@@ -52,12 +57,10 @@ def limpar_endereco_visual(location):
         numero = end.get('house_number', '')
         bairro = end.get('suburb', end.get('neighbourhood', ''))
         cidade = end.get('city', end.get('town', end.get('municipality', '')))
-        
         partes = []
         if rua: partes.append(rua)
         if numero: partes.append(numero)
         if bairro: partes.append(bairro)
-        
         texto_final = ", ".join(partes)
         if cidade: texto_final += f" - {cidade}"
         if len(texto_final) < 5: return location.address.split(',')[0]
@@ -65,19 +68,17 @@ def limpar_endereco_visual(location):
     except:
         return location.address.split(',')[0]
 
-def enviar_para_n8n(dados):
-    """Envia os dados para o Webhook do n8n"""
+def enviar_para_webhook(dados):
+    """Envia os dados para o Google Sheets via Webhook"""
     if not WEBHOOK_URL:
-        return False, "Link do n8n não configurado no código."
-    
+        return False, "URL do Webhook não configurada."
     try:
         headers = {"Content-Type": "application/json"}
         response = requests.post(WEBHOOK_URL, data=json.dumps(dados), headers=headers)
-        
         if response.status_code == 200:
             return True, "Sucesso"
         else:
-            return False, f"Erro {response.status_code}: {response.text}"
+            return False, f"Erro {response.status_code}"
     except Exception as e:
         return False, str(e)
 
@@ -87,17 +88,14 @@ def carregar_dados():
         df = pd.read_csv(URL_CSV)
         df.columns = df.columns.str.strip()
         df = df.dropna(subset=['Nome do Life'])
-        
-        geolocator = Nominatim(user_agent="app_paz_v2_auto")
+        geolocator = Nominatim(user_agent="app_paz_v2_webhook")
         latitudes = []
         longitudes = []
-        
         for endereco in df['Endereço']:
             if not isinstance(endereco, str) or endereco.strip() == "":
                 latitudes.append(None); longitudes.append(None)
                 continue
             try:
-                # Otimização: Cache simples manual se o endereço repetir
                 query = f"{endereco}, Brasil"
                 loc = geolocator.geocode(query, timeout=10)
                 if loc:
@@ -106,7 +104,6 @@ def carregar_dados():
                     latitudes.append(None); longitudes.append(None)
             except:
                 latitudes.append(None); longitudes.append(None)
-        
         df['lat'] = latitudes
         df['lon'] = longitudes
         return df.dropna(subset=['lat', 'lon'])
@@ -121,8 +118,7 @@ def obter_lat_lon_usuario(endereco):
         loc = geolocator.geocode(query)
         if not loc: loc = geolocator.geocode(f"{endereco}, Brasil")
         if loc:
-            endereco_bonito = limpar_endereco_visual(loc)
-            return loc.latitude, loc.longitude, endereco_bonito
+            return loc.latitude, loc.longitude, limpar_endereco_visual(loc)
         return None, None, None
     except:
         return None, None, None
@@ -134,6 +130,13 @@ def exibir_cartoes(dataframe, nome_user, zap_user, is_online=False):
             c1, c2 = st.columns([1.5, 1])
             
             bairro = row['Bairro'] if 'Bairro' in row else "Região não informada"
+            lider_original = row['Líderes']
+            
+            # --- LÓGICA DE TESTE ---
+            if MODO_TESTE:
+                tel_lider = ZAP_TESTE # Redireciona para você
+            else:
+                tel_lider = extrair_zap(row['Telefone'])
             
             with c1:
                 st.markdown(f"### 💙 {row['Nome do Life']}")
@@ -145,41 +148,55 @@ def exibir_cartoes(dataframe, nome_user, zap_user, is_online=False):
                 st.write(f"📅 {row['Dia da Semana']} às {row['Horário de Início']}")
             
             with c2:
-                # Botão de Solicitação Automática
-                # Precisamos de uma chave única para cada botão
-                btn_key = f"btn_solicitar_{index}"
-                
-                if st.button("🚀 Quero Participar", key=btn_key):
-                    if not nome_user or not zap_user:
-                        st.error("Preencha seu Nome e WhatsApp lá em cima primeiro!")
-                    else:
-                        with st.spinner("Enviando solicitação..."):
-                            # Prepara o pacote de dados
-                            dados_lead = {
-                                "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "visitante_nome": nome_user,
-                                "visitante_zap": zap_user,
-                                "life_nome": row['Nome do Life'],
-                                "lider_nome": row['Líderes'],
-                                "lider_zap": extrair_zap(row['Telefone']),
-                                "modo": row['Modo']
-                            }
-                            
-                            # Dispara para o n8n
-                            sucesso, msg = enviar_para_n8n(dados_lead)
-                            
-                            if sucesso:
-                                st.success("✅ Solicitação Enviada! O líder recebeu seu contato e vai te chamar em breve.")
-                                st.balloons()
-                            else:
-                                st.error(f"Erro no envio: {msg}")
+                if tel_lider:
+                    # Botão 1: Solicitação Automática (Webhook)
+                    # Cria uma chave única para o botão não confundir
+                    btn_key = f"btn_auto_{index}"
+                    
+                    if st.button("🚀 Quero Participar", key=btn_key):
+                        if not nome_user or not zap_user:
+                            st.error("⚠️ Preencha Nome e WhatsApp no topo da página!")
+                        else:
+                            with st.spinner("Enviando solicitação..."):
+                                dados = {
+                                    "visitante_nome": nome_user,
+                                    "visitante_zap": zap_user,
+                                    "life_nome": row['Nome do Life'],
+                                    "lider_nome": lider_original,
+                                    "lider_zap": tel_lider,
+                                    "modo": row['Modo']
+                                }
+                                ok, info = enviar_para_webhook(dados)
+                                if ok:
+                                    st.success("✅ Solicitação Enviada! O líder foi avisado.")
+                                    st.balloons()
+                                    if MODO_TESTE:
+                                        st.caption("ℹ️ Modo Teste: E-mail enviado para filipecx@gmail.com")
+                                else:
+                                    st.error("Erro ao conectar. Tente o botão de WhatsApp abaixo.")
 
-# --- INÍCIO DO APP ---
+                    # Botão 2: WhatsApp direto (Fallback)
+                    msg_zap = f"Olá, sou {nome_user}. Tenho interesse no LifeGroup {row['Nome do Life']}."
+                    link_zap = f"https://wa.me/{tel_lider}?text={urllib.parse.quote(msg_zap)}"
+                    
+                    st.markdown(f"""
+                    <a href="{link_zap}" target="_blank" style="text-decoration:none;">
+                        <div style="background-color:#eee;color:#333;padding:8px;border-radius:6px;text-align:center;font-weight:bold;font-size:12px;margin-top:5px;border:1px solid #ccc;">
+                            📞 Ou chame no WhatsApp
+                        </div>
+                    </a>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.error("Sem contato cadastrado")
+
+# --- APP START ---
 try: st.image("logo_menor.png", width=150)
 except: pass
 
 st.title("Encontre seu LifeGroup")
-st.markdown("**Paz Church São Paulo**")
+
+if MODO_TESTE:
+    st.warning("⚠️ MODO DE TESTE ATIVO: Todas as mensagens irão para Filipe.")
 
 df_geral = carregar_dados()
 
@@ -192,7 +209,7 @@ with st.form("form_busca"):
     c1, c2 = st.columns(2)
     with c1: nome = st.text_input("Nome")
     with c2: whatsapp = st.text_input("WhatsApp (com DDD)")
-    endereco_usuario = st.text_input("Endereço ou Bairro", placeholder="Ex: Rua Henrique Felipe da Costa, Vila Guilherme")
+    endereco_usuario = st.text_input("Endereço ou Bairro", placeholder="Ex: Rua Henrique Felipe da Costa")
     
     st.markdown("---")
     st.markdown("### 2. Preferências")
@@ -201,12 +218,11 @@ with st.form("form_busca"):
     with f2: filtro_dia = st.multiselect("Dias", options=opcoes_dia, default=opcoes_dia)
     with f3: filtro_modo = st.multiselect("Modo", options=opcoes_modo, default=opcoes_modo)
     
-    buscar = st.form_submit_button("🔍 BUSCAR DISPONÍVEIS")
+    buscar = st.form_submit_button("🔍 BUSCAR")
 
-# --- LÓGICA DE EXIBIÇÃO ---
 if buscar:
     if not nome or not whatsapp or not endereco_usuario:
-        st.warning("⚠️ Preencha todos os campos acima para buscar.")
+        st.warning("⚠️ Preencha todos os campos.")
     elif df_geral.empty:
         st.error("Base vazia.")
     else:
@@ -217,33 +233,46 @@ if buscar:
         ]
         
         if df_filtrado.empty:
-            st.warning("Nenhum life encontrado com esses filtros.")
+            st.warning("Nenhum life encontrado.")
         else:
             lat_user, lon_user, endereco_bonito = obter_lat_lon_usuario(endereco_usuario)
             
             if lat_user:
-                st.info(f"📍 **Referência:** {endereco_bonito}")
+                st.info(
+                    f"📍 **Referência:** {endereco_bonito}\n\n"
+                    "Usamos este endereço para calcular a distância. Não é aqui? Edite acima."
+                )
                 
                 df_online = df_filtrado[df_filtrado['Modo'].astype(str).str.contains("Online", case=False)]
                 df_presencial = df_filtrado[~df_filtrado['Modo'].astype(str).str.contains("Online", case=False)]
                 
-                # Renderiza Presenciais
-                if not df_presencial.empty:
-                    user_loc = (lat_user, lon_user)
-                    df_presencial['distancia'] = df_presencial.apply(
-                        lambda row: geodesic(user_loc, (row['lat'], row['lon'])).km, axis=1
-                    )
-                    df_sorted = df_presencial.sort_values(by='distancia')
-                    
+                # Renderiza Abas se tiver os dois tipos
+                if not df_presencial.empty and not df_online.empty:
+                    t1, t2 = st.tabs(["📍 Presenciais", "💻 Online"])
+                    with t1:
+                        user_loc = (lat_user, lon_user)
+                        df_presencial['distancia'] = df_presencial.apply(lambda r: geodesic(user_loc, (r['lat'], r['lon'])).km, axis=1)
+                        df_sorted = df_presencial.sort_values(by='distancia')
+                        exibir_cartoes(df_sorted.head(3), nome, whatsapp, is_online=False)
+                        if len(df_sorted) > 3:
+                            with st.expander(f"➕ Ver mais {len(df_sorted)-3} presenciais..."):
+                                exibir_cartoes(df_sorted.iloc[3:], nome, whatsapp, is_online=False)
+                    with t2:
+                        exibir_cartoes(df_online, nome, whatsapp, is_online=True)
+
+                # Só Presenciais
+                elif not df_presencial.empty:
                     st.markdown("### 📍 Presenciais Próximos")
+                    user_loc = (lat_user, lon_user)
+                    df_presencial['distancia'] = df_presencial.apply(lambda r: geodesic(user_loc, (r['lat'], r['lon'])).km, axis=1)
+                    df_sorted = df_presencial.sort_values(by='distancia')
                     exibir_cartoes(df_sorted.head(3), nome, whatsapp, is_online=False)
-                    
                     if len(df_sorted) > 3:
                         with st.expander(f"➕ Ver mais {len(df_sorted)-3} presenciais..."):
                             exibir_cartoes(df_sorted.iloc[3:], nome, whatsapp, is_online=False)
                 
-                # Renderiza Online
-                if not df_online.empty:
+                # Só Online
+                elif not df_online.empty:
                     st.markdown("### 💻 Opções Online")
                     exibir_cartoes(df_online, nome, whatsapp, is_online=True)
             else:
